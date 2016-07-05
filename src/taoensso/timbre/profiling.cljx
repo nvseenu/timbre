@@ -1,87 +1,120 @@
 (ns taoensso.timbre.profiling
-  "Simple logging profiler for Timbre. Highly optimized; supports
-  sampled profiling in production."
+  "Simple, fast, cross-platform logging profiler for Timbre.
+
+  Quick usage summary:
+    1. Wrap (name) interesting forms/fns with `p`/`defnp`.
+    2. Use `profiled` to return [<result> ?<thread-local-stats>].
+       use `profile`  to return  <result> and log ?<thread-local-stats>.
+    3. Use `dynamic-profiled`,
+           `dynamic-profile` for capturing stats from all (dynamic) threads.
+
+  Filtering and elision:
+    Support ns+level elision and runtime filtering:  `p`, `profiled`, `profile`.
+    Support arbitrary conditional logging (e.g sampling): `profiled`, `profile`.
+
+  How/where to use this:
+    Timbre's profiling is highly optimized: even without elision, you can
+    usually leave profiling code in production (e.g. for sampled profiling,
+    or to detect unusual performance). Timbre's stats maps are well suited
+    to programmatic inspection + analysis."
+
   {:author "Peter Taoussanis (@ptaoussanis)"}
-  (:require [taoensso.encore :as enc]
-            [taoensso.timbre :as timbre]))
+  (:require [taoensso.encore :as enc    :refer-macros ()]
+            [taoensso.timbre :as timbre :refer-macros ()])
+
+  #+cljs (:require-macros [taoensso.timbre.profiling :refer (nano-time)])
+  #+clj  (:import [java.util LinkedList]))
 
 (comment (require '[taoensso.encore :as enc :refer (qb)]))
 
-;;;; TODO
-;; * Support for explicit `config` args?
-;; * Support for real level+ns based elision (zero *pdata* check cost, etc.)?
-;;   - E.g. perhaps `p` forms could take a logging level?
-;; * Perf: cljs could use `pdata-proxy`-like mutable accumulation, etc.
+;;;; Platform stuff
 
-;;;; Utils
+(defmacro nano-time [] `(enc/if-cljs (enc/nano-time) (System/nanoTime)))
+(comment (macroexpand '(nano-time)))
 
-;; Note that we only support *compile-time* ids
-(defn- qualified-kw [ns id] (if (enc/qualified-keyword? id) id (keyword (str ns) (name id))))
-(comment (qualified-kw *ns* "foo"))
+(do ; Time accumulators (can be mutable since they'll be thread-local)
+  (defn- add-time    [#+clj ^LinkedList x #+cljs ^ArrayList x t] (.add   x t))
+  (defn- count-times [#+clj ^LinkedList x #+cljs ^ArrayList x]   (.size  x))
+  (defn- clear-times [#+clj ^LinkedList x #+cljs ^ArrayList x]   (.clear x))
+  (defn- new-times [] #+clj (LinkedList.) #+cljs (array-list)))
 
-#+clj
-(def ^:private elide-profiling?
-  "Completely elide all profiling? In particular, eliminates proxy checks.
-  TODO Temp, until we have a better elision strategy."
-  (enc/read-sys-val "TIMBRE_ELIDE_PROFILING"))
+(def ^:static -pdata-proxy
+  "{<id> <times> :__stats <m-stats> :__clock <m-clock>} iff profiling active
+  on thread. This is substantially faster than a ^:dynamic atom. Would esp.
+  benefit from ^:static support / direct linking / a Java class."
+  #+clj
+  (let [^ThreadLocal proxy (proxy [ThreadLocal] [])]
+    (fn
+      ([]        (.get proxy))
+      ([new-val] (.set proxy new-val) new-val)))
 
-;;;;
+  #+cljs
+  (let [state_ (volatile! false)] ; Automatically thread-local in js
+    (fn
+      ([]                @state_)
+      ([new-val] (vreset! state_ new-val)))))
 
-(def ^:dynamic *pdata_* "(atom {<id> <times>}), nnil iff profiling" nil)
-(defmacro -with-pdata_ [& body] `(binding [*pdata_* (atom {})] ~@body)) ; Dev
-
-(comment (qb 1e6 (if *pdata_* true false) (if false true false)))
+;;;; Core fns
 
 (declare ^:private times->stats)
-(defn -capture-time!
-  ([       id t-elapsed] (-capture-time! *pdata_* id t-elapsed)) ; Dev
-  ([pdata_ id t-elapsed] ; Common case
-   (let [?pulled-times
-         (loop []
-           (let [pdata @pdata_]
-             (let [times (get pdata id ())]
-               (if (>= (count times) 2000000) ; Rare in real-world use
-                 (if (compare-and-set! pdata_ pdata ; Never leave empty times:
-                       (assoc pdata id (conj () t-elapsed)))
-                   times ; Pull accumulated times
-                   (recur))
 
-                 (if (compare-and-set! pdata_ pdata
-                       (assoc pdata id (conj times t-elapsed)))
-                   nil
-                   (recur))))))]
+;;; Low-level primitives (undocumented), use with caution
+#+clj  (defn          profiling? [] (if (-pdata-proxy) true false))
+#+cljs (defn ^boolean profiling? [] (if (-pdata-proxy) true false))
+(defn           start-profiling! [] (-pdata-proxy {:__t0 (nano-time)}) nil)
+(defn            stop-profiling! [] ; Returns ?m-stats
+  (when-let [pdata (-pdata-proxy)]
+    (let [t1      (nano-time)
+          t0      (get    pdata :__t0)
+          m-stats (get    pdata :__stats) ; Interim stats
+          m-times (dissoc pdata :__stats :__t0)
+          m-stats ; {<id> <stats>}
+          (reduce-kv
+            (fn [m id times]
+              (assoc m id (times->stats times (get m-stats id))))
+            {:__clock {:t0 t0 :t1 t1 :total (- t1 ^long t0)}}
+            m-times)]
+      (-pdata-proxy nil)
+      m-stats)))
 
-     (when-let [times ?pulled-times]
-       ;; Compact: merge interim stats to help prevent OOMs
-       (let [base-stats (get-in @pdata_ [:__stats id])
-             stats (times->stats times base-stats)]
-         ;; Can safely assume that base-stats should be stable
-         (swap! pdata_ assoc-in [:__stats id] stats)))
+(defn ^:static -capture-time! [pdata id t-elapsed]
+  (if-let [times (get pdata id)]
+    (if (>= (long (count-times times)) #_20 2000000) ; Rare in real-world use
+      ;; Compact: merge interim stats to help prevent OOMs
+      (let [m-stats (get pdata :__stats)
+            m-stats (assoc m-stats id (times->stats times (get m-stats id)))]
 
-     nil)))
+        (clear-times times)
+        (add-time    times t-elapsed) ; Nb: never leave our accumulator empty
+        (-pdata-proxy (assoc pdata :__stats m-stats)))
 
-(comment
-  (-with-pdata_ (qb 1e6 (-capture-time! :foo 1000))) ; 304.88 (vs 70 proxy)
-  (-with-pdata_
-    (dotimes [_ 20] (-capture-time! :foo 100000))
-    @*pdata_*))
+      ;; Common case
+      (add-time times t-elapsed))
 
-(def ^:private ^:const max-long #+clj Long/MAX_VALUE #+cljs 9223372036854775807)
+    ;; Init case
+    (let [times (new-times)]
+      (add-time times t-elapsed)
+      (-pdata-proxy (assoc pdata id times))))
 
-(defn- times->stats [times ?base-stats]
-  (let [ts-count     (count times)
-        _            (assert (not (zero? ts-count)))
-        ts-time      (reduce (fn [^long acc ^long in] (+ acc in)) 0 times)
-        ts-mean      (/ (double ts-time) (double ts-count))
-        ts-mad-sum   (reduce (fn [^long acc ^long in] (+ acc (Math/abs (- in ts-mean)))) 0 times)
-        ts-min       (reduce (fn [^long acc ^long in] (if (< in acc) in acc)) max-long     times)
-        ts-max       (reduce (fn [^long acc ^long in] (if (> in acc) in acc)) 0            times)]
+  nil)
 
-    (if-let [stats ?base-stats] ; Merge over previous stats
+(def ^:private ^:const max-long #+clj Long/MAX_VALUE #+cljs 9007199254740991)
+
+(defn- times->stats [times ?interim-stats]
+  (let [ts-count   (long (count-times times))
+        _          (assert (not (zero? ts-count)))
+        times      (vec times) ; Faster to reduce
+        ts-time    (reduce (fn [^long acc ^long in] (+ acc in)) 0 times)
+        ts-mean    (/ (double ts-time) (double ts-count))
+        ts-mad-sum (reduce (fn [^long acc ^long in] (+ acc (Math/abs (- in ts-mean)))) 0 times)
+        ts-min     (reduce (fn [^long acc ^long in] (if (< in acc) in acc)) max-long     times)
+        ts-max     (reduce (fn [^long acc ^long in] (if (> in acc) in acc)) 0            times)]
+
+    (if-let [stats ?interim-stats] ; Merge over previous stats
       (let [s-count   (+ ^long (get stats :count) ts-count)
-            s-time    (+ ^long (get stats :time)  ts-time)
+            s-time    (+ ^long (get stats :time) ^long ts-time)
             s-mean    (/ (double s-time) (double s-count))
-            s-mad-sum (+ ^long (get stats :mad-sum) ts-mad-sum)
+            s-mad-sum (+ ^long (get stats :mad-sum) ^long ts-mad-sum)
             s-mad     (/ (double s-mad-sum) (double s-count))
             s0-min    (get stats :min)
             s0-max    (get stats :max)]
@@ -106,30 +139,271 @@
        :min     ts-min
        :max     ts-max})))
 
-(comment (times->stats [] nil))
+(comment (times->stats (new-times) nil))
 
-(defn -compile-final-stats! "Returns {<id> <stats>}"
-  ([       clock-time] (-compile-final-stats! *pdata_* clock-time)) ; Dev
-  ([pdata_ clock-time] ; Common
-   (let [pdata @pdata_
-         m-stats (get    pdata :__stats)
-         m-times (dissoc pdata :__stats)]
-     (reduce-kv
-       (fn [m id times]
-         (assoc m id (times->stats times (get m-stats id))))
-       {:clock-time clock-time} m-times))))
+;;;; Elision support
+
+#+clj
+(def ^:private elide-profiling?
+  "Completely elide all profiling regardless of level/ns?"
+  (enc/read-sys-val "TIMBRE_ELIDE_PROFILING"))
+
+#+clj
+(defn -elide? [level-form ns-str-form]
+  (or elide-profiling? (timbre/-elide? level-form ns-str-form)))
+
+;;;; Core macros
+
+(def ^:dynamic *sacc* "Dynamic stats accumulator, experimental" nil)
+
+(defmacro profiled
+  "When logging is enabled, executes body with thread-local profiling.
+  Always returns [<body-result> ?<stats>]."
+  {:arglists '([level            & body]
+               [level :when test & body])}
+  [level & sigs]
+  (let [[s1 s2 & sn] sigs]
+    (if-not (= s1 :when)
+      `(profiled ~level :when true ~@sigs)
+      (let [test s2, body sn]
+        (if (-elide? level (str *ns*))
+          `[(do ~@body)]
+          `(if (and (timbre/log? ~level ~(str *ns*)) ~test)
+             (try
+               (start-profiling!)
+               (let [result# (do ~@body)
+                     stats#  (stop-profiling!)
+                     stats#
+                     (when stats#
+                       (let [sacc# *sacc*] ; Dynamic capture
+                         (if sacc#
+                           (do (sacc# stats#) nil)
+                           stats#)))]
+                 [result# stats#])
+               (finally (-pdata-proxy nil)))
+             [(do ~@body)]))))))
 
 (comment
-  (qb 1e5
-    (-with-pdata_
-     (-capture-time! :foo 10)
-     (-capture-time! :foo 20)
-     (-capture-time! :foo 30)
-     (-capture-time! :foo 10)
-     (-compile-final-stats! 0))) ; 235 (vs 114 proxy)
-  )
+  (qb 1e5 (profiled :info (p :p1))) ; 176
+  (profiled :info :when (chance 0.5) (p :p1) "foo"))
 
-;;;;
+(defn- compile-time-pid [id]
+  (if (enc/qualified-keyword? id)
+    id
+    (if (enc/ident? id)
+      (keyword (str *ns*) (name id))
+      (throw (ex-info "Unexpected `timbre/profiling` id type"
+               {:id id :type (type id)})))))
+
+(comment (compile-time-pid :foo))
+
+(defmacro pspy
+  "Profiling spy. When profiling, records execution time of named body.
+  Always returns body's result."
+  {:arglists '([id & body] [level id & body])}
+  [& specs]
+  (let [[s1 s2] specs
+        [level id body]
+        (if (and (timbre/level? s1) (enc/ident? s2))
+          [s1      s2 (nnext specs)]
+          [:report s1  (next specs)])]
+
+    (let [id (compile-time-pid id)]
+      (if (-elide? level (str *ns*))
+        `(do ~@body)
+        `(let [pdata# (-pdata-proxy)]
+           (if pdata#
+             (let [t0#     (nano-time)
+                   result# (do ~@body)
+                   t1#     (nano-time)]
+               (-capture-time! pdata# ~id (- t1# t0#))
+               result#)
+             (do ~@body)))))))
+
+(comment (macroexpand '(pspy :info foo/id "foo")))
+
+;;;; Helper macros, etc.
+
+(defn chance [p] (< ^double (rand) (double p)))
+
+(defmacro p "`pspy` alias" [& specs] `(pspy ~@specs))
+(comment (macroexpand '(p :foo (+ 4 2))))
+
+(declare format-stats)
+(defmacro  -log-stats [level id stats]
+  `(timbre/log! ~level :p
+     ["Profiling: " ~id "\n" (format-stats ~stats)]
+     {:?base-data {:profile-stats ~stats}}))
+
+(comment (profile :info :my-id :when true "foo"))
+
+(defmacro profile
+  "When logging is enabled, executes named body with thread-local profiling
+  and logs stats. Always returns body's result."
+  {:arglists '([level id            & body]
+               [level id :when test & body])}
+  [level id & sigs]
+  (let [id (compile-time-pid id)]
+    `(let [[result# stats#] (profiled ~level ~@sigs)]
+       (when stats# (-log-stats ~level ~id stats#))
+       result#)))
+
+;;;; Multi-threaded profiling ; Experimental
+
+(defn merge-stats
+  "Merges stats maps from multiple runs, threads, etc.
+  Automatically identifies and merges concurrent time windows."
+  [s1 s2]
+  (if s1
+    (if s2
+      (let [clock1 (get s1 :__clock)
+            clock2 (get s2 :__clock)
+            clock3
+            (enc/if-lets
+              [^long s1-t0 (get clock1 :t0)
+               ^long s1-t1 (get clock1 :t1)
+               ^long s2-t0 (get clock2 :t0)
+               ^long s2-t1 (get clock2 :t1)
+               any-clock-overlap?
+               (or (and (<= s2-t0 s1-t1)
+                        (>= s2-t1 s1-t0))
+                   (and (<= s1-t0 s2-t1)
+                        (>= s1-t1 s2-t0)))]
+
+              (let [^long s3-t0 (if (< s1-t0 s2-t0) s1-t0 s2-t0)
+                    ^long s3-t1 (if (< s1-t1 s2-t1) s1-t1 s2-t1)]
+
+                {:t0 s3-t0 :t1 s3-t1 :total (- s3-t1 s3-t0)})
+
+              {:total (+ ^long (get clock1 :total)
+                         ^long (get clock2 :total))})
+
+            s1      (dissoc s1 :__clock)
+            s2      (dissoc s2 :__clock)
+            all-ids (into (set (keys s1)) (keys s2))]
+
+        (reduce
+          (fn [m id]
+            (let [sid1 (get s1 id)
+                  sid2 (get s2 id)]
+              (if sid1
+                (if sid2
+                  (let [^long s1-count   (get sid1 :count)
+                        ^long s1-time    (get sid1 :time)
+                        ^long s1-mad-sum (get sid1 :mad-sum)
+                        ^long s1-min     (get sid1 :min)
+                        ^long s1-max     (get sid1 :max)
+
+                        ^long s2-count   (get sid2 :count)
+                        ^long s2-time    (get sid2 :time)
+                        ^long s2-mad-sum (get sid2 :mad-sum)
+                        ^long s2-min     (get sid2 :min)
+                        ^long s2-max     (get sid2 :max)
+
+                        s3-count   (+ s1-count   s2-count)
+                        s3-time    (+ s1-time    s2-time)
+                        s3-mad-sum (+ s1-mad-sum s2-mad-sum)]
+
+                    (assoc m id
+                      {:count   s3-count
+                       :time    s3-time
+                       :mean    (/ (double s3-time) (double s3-count))
+                       :mad-sum s3-mad-sum
+                       :mad     (/ (double s3-mad-sum) (double s3-count))
+                       :min     (if (< s1-min s2-min) s1-min s2-min)
+                       :max     (if (> s1-max s2-max) s1-max s2-max)}))
+                  m #_(assoc m id sid1))
+                (assoc m id sid2))))
+          (assoc s1 :__clock clock3)
+          all-ids))
+      s1)
+    s2))
+
+(defn stats-accumulator
+  "Experimental, subject to change!
+  Small util to help merge stats maps from multiple threads.
+  Returns a stateful fn with arities:
+    ([stats-map]) ; Accumulates the given stats (you may call this from any thread)
+    ([])          ; Deref: returns the merged value of all accumulated stats
+
+  See also `profile-into`."
+  []
+  (let [acc_ (atom nil)
+        reduce-stats_
+        (delay
+          (let [merge-stats (enc/memoize_ merge-stats)]
+            (enc/memoize_ (fn [acc] (reduce merge-stats nil acc)))))]
+
+    (fn stats-accumulator
+      ([stats-map] (when stats-map (swap! acc_ conj stats-map)))
+      ([] (when-let [acc @acc_] (@reduce-stats_ acc))))))
+
+(comment (qb 1e5 (stats-accumulator)))
+
+(defmacro profile-into
+  "Experimental, subject to change!
+  When logging is enabled, executes body with thread-local profiling
+  and adds stats to given accumulator. Always returns body's result.
+  See also `stats-accumulator`."
+  {:arglists '([?stats-accumulator level            & body]
+               [?stats-accumulator level :when test & body])}
+  [sacc level & sigs]
+  (let [[s1 s2 & sn] sigs]
+    (if-not (= s1 :when)
+      `(profiled-into ~sacc ~level :when true ~@sigs)
+      (let [test s2, body sn]
+        (if (-elide? level (str *ns*))
+          `(do ~@body)
+          `(let [sacc# ~sacc]
+             (if (and sacc# (timbre/log? ~level ~(str *ns*)) ~test)
+               (try
+                 (start-profiling!)
+                 (let [result# (do ~@body)
+                       stats# (stop-profiling!)]
+                   (sacc# stats#)
+                   result#)
+                 (finally (-pdata-proxy nil))))
+             (do ~@body)))))))
+
+(defmacro dynamic-profiled
+  "Experimental, subject to change!
+  When logging is enabled, executes body with a dynamic binding that
+  will capture and merge profiling stats from all (dynamic) threads.
+  Always returns [<body-result> ?<merged-stats>]."
+  [level & body]
+  (if (-elide? level (str *ns*))
+    `[(do ~@body)]
+    `(if (timbre/log? ~level ~(str *ns*))
+       (let [sacc# (stats-accumulator)]
+         (binding [*sacc* sacc#]
+           [(do ~@body) (sacc#)]))
+       [(do ~@body)])))
+
+(defmacro dynamic-profile
+  "Experimental, subject to change!
+  Like `profile` but captures stats from all profiling calls in expr's
+  dynamic scope."
+  [level id & body]
+  (if (-elide? level (str *ns*))
+    `[(do ~@body)]
+    `(if (timbre/log? ~level ~(str *ns*))
+       (let [sacc# (stats-accumulator)]
+         (binding [*sacc* sacc#]
+           (let [result# (do ~@body)
+                 stats#  (sacc#)]
+             (when stats# (-log-stats ~level ~id stats#))
+             result#)))
+       [(do ~@body)])))
+
+(comment
+  (dynamic-profile :info :id
+    (future (profile :info :thread1                    (p :p1)))
+    (future (profile :info :thread2 :when (chance 0.5) (p :p2)))
+    (future (profile :info :thread3 :when (chance 0.5) (p :p3)))
+    (Thread/sleep 20)
+    "foo"))
+
+;;;; Output formatting
 
 (defn- perc [n d] (Math/round (/ (double n) (double d) 0.01)))
 (comment (perc 14 24))
@@ -142,139 +416,69 @@
       (>= ns       1000) (str (enc/round2 (/ ns       1000)) "μs") ; 1e3
       :else              (str                ns              "ns"))))
 
-(defn -format-stats
-  ([stats           ] (-format-stats stats :time))
+(defn format-stats
+  ([stats           ] (format-stats stats :time))
   ([stats sort-field]
-   (let [clock-time      (get    stats :clock-time)
-         stats           (dissoc stats :clock-time)
-         ^long accounted (reduce-kv (fn [^long acc k v] (+ acc ^long (:time v))) 0 stats)
+   (when stats
+     (let [clock-time      (get-in stats [:__clock :total])
+           stats           (dissoc stats  :__clock)
+           ^long accounted (reduce-kv (fn [^long acc k v] (+ acc ^long (:time v))) 0 stats)
 
-         sorted-stat-ids
-         (sort-by
-           (fn [id] (get-in stats [id sort-field]))
-           enc/rcompare
-           (keys stats))
+           sorted-stat-ids
+           (sort-by
+             (fn [id] (get-in stats [id sort-field]))
+             enc/rcompare
+             (keys stats))
 
-         ^long max-id-width
-         (reduce-kv
-          (fn [^long acc k v]
-            (let [c (count (str k))]
-              (if (> c acc) c acc)))
-          #=(count "Accounted Time")
-          stats)]
+           ^long max-id-width
+           (reduce-kv
+             (fn [^long acc k v]
+               (let [c (count (str k))]
+                 (if (> c acc) c acc)))
+             #=(count "Accounted Time")
+             stats)]
 
-     #+cljs
-     (let [sb
-           (reduce
-             (fn [acc id]
-               (let [{:keys [count min max mean mad time]} (get stats id)]
-                 (enc/sb-append acc
-                   (str
-                     {:id      id
-                      :n-calls count
-                      :min     (ft min)
-                      :max     (ft max)
-                      :mad     (ft mad)
-                      :mean    (ft mean)
-                      :time%   (perc time clock-time)
-                      :time    (ft time)}
-                     "\n"))))
-             (enc/str-builder)
-             sorted-stat-ids)]
+       #+cljs
+       (let [sb
+             (reduce
+               (fn [acc id]
+                 (let [{:keys [count min max mean mad time]} (get stats id)]
+                   (enc/sb-append acc
+                     (str
+                       {:id      id
+                        :n-calls count
+                        :min     (ft min)
+                        :max     (ft max)
+                        :mad     (ft mad)
+                        :mean    (ft mean)
+                        :time%   (perc time clock-time)
+                        :time    (ft time)}
+                       "\n"))))
+               (enc/str-builder)
+               sorted-stat-ids)]
 
-       (enc/sb-append sb "\n")
-       (enc/sb-append sb (str "Clock Time: (100%) " (ft clock-time) "\n"))
-       (enc/sb-append sb (str "Accounted Time: (" (perc accounted clock-time) "%) " (ft accounted) "\n"))
-       (str           sb))
+         (enc/sb-append sb "\n")
+         (enc/sb-append sb (str "Clock Time: (100%) " (ft clock-time) "\n"))
+         (enc/sb-append sb (str "Accounted Time: (" (perc accounted clock-time) "%) " (ft accounted) "\n"))
+         (str           sb))
 
-     #+clj
-     (let [pattern   (str "%" max-id-width "s %,11d %9s %10s %9s %9s %7d %1s%n")
-           s-pattern (str "%" max-id-width  "s %11s %9s %10s %9s %9s %7s %1s%n")
-           sb
-           (reduce
-             (fn [acc id]
-               (let [{:keys [count min max mean mad time]} (get stats id)]
-                 (enc/sb-append acc
-                   (format pattern id count (ft min) (ft max) (ft mad)
-                     (ft mean) (perc time clock-time) (ft time)))))
+       #+clj
+       (let [pattern   (str "%" max-id-width "s %,11d %9s %10s %9s %9s %7d %1s%n")
+             s-pattern (str "%" max-id-width  "s %11s %9s %10s %9s %9s %7s %1s%n")
+             sb
+             (reduce
+               (fn [acc id]
+                 (let [{:keys [count min max mean mad time]} (get stats id)]
+                   (enc/sb-append acc
+                     (format pattern id count (ft min) (ft max) (ft mad)
+                       (ft mean) (perc time clock-time) (ft time)))))
 
-             (enc/str-builder (format s-pattern "Id" "nCalls" "Min" "Max" "MAD" "Mean" "Time%" "Time"))
-             sorted-stat-ids)]
+               (enc/str-builder (format s-pattern "Id" "nCalls" "Min" "Max" "MAD" "Mean" "Time%" "Time"))
+               sorted-stat-ids)]
 
-       (enc/sb-append sb (format s-pattern "Clock Time"     "" "" "" "" "" 100 (ft clock-time)))
-       (enc/sb-append sb (format s-pattern "Accounted Time" "" "" "" "" "" (perc accounted clock-time) (ft accounted)))
-       (str sb)))))
-
-;;;;
-
-(defmacro pspy
-  "Profile spy. When ^:dynamic profiling is enabled, records
-  execution time of named body. Always returns the body's result."
-  [id & body]
-  (let [id (qualified-kw *ns* id)]
-    (if elide-profiling?
-      `(do ~@body)
-      `(let [pdata# *pdata_*]
-         (if pdata#
-           (let [t0# (System/nanoTime)
-                 result# (do ~@body)
-                 t1# (System/nanoTime)]
-             (-capture-time! pdata# ~id (- t1# t0#))
-             result#)
-           (do ~@body))))))
-
-(defmacro p [id & body] `(pspy ~id ~@body)) ; Alias
-
-(comment (macroexpand '(p :foo (+ 4 2))))
-
-(defmacro profiled
-  "Experimental, subject to change!
-  Low-level profiling util. Executes expr with ^:dynamic profiling
-  enabled, then executes body with `[<stats> <expr-result>]` binding, e.g:
-    (profiled \"foo\" [stats result] (do (println stats) result))"
-  [expr-to-profile params & body]
-  (assert (vector?    params))
-  (assert (= 2 (count params)))
-  (let [[stats result] params]
-    `(let [pdata# (atom {})]
-       (binding [*pdata_* pdata#]
-         (let [t0# (System/nanoTime)
-               ~result ~expr-to-profile
-               t1# (System/nanoTime)
-               ~stats (-compile-final-stats! pdata# (- t1# t0#))]
-           (do ~@body))))))
-
-(comment (profiled (p :foo "foo") [stats result] [stats result]))
-
-(defmacro profile
-  "When logging is enabled, executes named body with ^:dynamic profiling
-  enabled and logs profiling stats. Always returns body's result."
-  [level id & body]
-  (let [id (qualified-kw *ns* id)]
-    (if elide-profiling?
-      `(do ~@body)
-      `(if (timbre/log? ~level ~(str *ns*)) ; Runtime check
-         (profiled (do ~@body) [stats# result#]
-           (let [stats-str# (-format-stats stats#)]
-             (timbre/log! ~level :p
-               ["Profiling: " ~id "\n" stats-str#]
-               {:?base-data
-                {:profile-stats     stats#
-                 :profile-stats-str stats-str#}})
-             result#))
-         (do ~@body)))))
-
-(comment (profile :info :foo "foo"))
-
-(defmacro sampling-profile
-  "Like `profile`, but only enables profiling with given probability."
-  [level probability id & body]
-  (assert (<= 0 probability 1) "Probability: 0<=p<=1")
-  (if elide-profiling?
-    `(do ~@body)
-    `(if (< (rand) ~probability)
-       (profile ~level ~id ~@body)
-       (do                 ~@body))))
+         (enc/sb-append sb (format s-pattern "Clock Time"     "" "" "" "" "" 100 (ft clock-time)))
+         (enc/sb-append sb (format s-pattern "Accounted Time" "" "" "" "" "" (perc accounted clock-time) (ft accounted)))
+         (str sb))))))
 
 ;;;; fnp stuff
 
@@ -282,8 +486,8 @@
   (let [single-arity? (vector? (first sigs))
         sigs    (if single-arity? (list sigs) sigs)
         get-id  (if single-arity?
-                  (fn [fn-name _params]      (name fn-name))
-                  (fn [fn-name  params] (str (name fn-name) \_ (count params))))
+                  (fn [fn-name _params] (keyword (str *ns*) (str "fn_" (name fn-name))))
+                  (fn [fn-name  params] (keyword (str *ns*) (str "fn_" (name fn-name) \_ (count params)))))
         new-sigs
         (map
           (fn [[params & others]]
@@ -300,7 +504,7 @@
                [name? ([params*] prepost-map? body)+])}
   [& sigs]
   (let [[?fn-name sigs] (if (symbol? (first sigs)) [(first sigs) (next sigs)] [nil sigs])
-        new-sigs        (-fn-sigs (or ?fn-name 'anonymous-fn) sigs)]
+        new-sigs        (-fn-sigs (or ?fn-name (gensym "")) sigs)]
     (if ?fn-name
       `(fn ~?fn-name ~@new-sigs)
       `(fn           ~@new-sigs))))
@@ -308,9 +512,9 @@
 (comment
   (-fn-sigs "foo"      '([x]            (* x x)))
   (macroexpand '(fnp     [x]            (* x x)))
-  (macroexpand '(fn       [x]            (* x x)))
+  (macroexpand '(fn      [x]            (* x x)))
   (macroexpand '(fnp bob [x] {:pre [x]} (* x x)))
-  (macroexpand '(fn       [x] {:pre [x]} (* x x))))
+  (macroexpand '(fn      [x] {:pre [x]} (* x x))))
 
 (defmacro defnp "Like `defn` but wraps fn bodies with `p` macro."
   {:arglists
@@ -335,6 +539,9 @@
 (defmacro p*      "Deprecated" [& body] `(pspy ~@body))
 
 (comment (profile :info :pspy* (pspy* :foo (fn [] (Thread/sleep 100)))))
+
+(defmacro sampling-profile "Deprecated" [level probability id & body]
+  `(profile ~level ~id :when (< (rand) ~probability) ~@body))
 
 ;;;;
 
@@ -363,8 +570,8 @@
          (p :mult (reduce * nums))
          (p :div  (reduce / nums)))))
 
-  (profile :info :Arithmetic (dotimes [n 100] (my-fn)))
-  (profile :info :high-n     (dotimes [n 1e5] (p :nil nil))) ; ~46ms  vs ~20ms
-  (profile :info :high-n     (dotimes [n 1e6] (p :nil nil))) ; ~370ms vs ~116ms
-  (profiled (dotimes [n 1e6] (p :nil nil)) [stats result] [stats result])
-  (sampling-profile :info 0.5 :sampling-test (p :string "Hello!")))
+  (profile  :info :Arithmetic (dotimes [n 100] (my-fn)))
+  (profile  :info :high-n     (dotimes [n 1e5] (p :p1 nil))) ; ~22ms
+  (profile  :info :high-n     (dotimes [n 1e6] (p :p1 nil))) ; ~119ms
+  (profiled :info (dotimes [n 1e6] (p :p1 nil)))
+  (sampling-profile :info 0.5 :sampling-test (p :p1 "Hello!")))

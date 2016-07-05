@@ -152,9 +152,10 @@
 
 ;;;; Levels
 
+(def level?        #{:trace :debug :info :warn :error :fatal :report})
 (def ordered-levels [:trace :debug :info :warn :error :fatal :report])
 (def ^:private scored-levels (zipmap ordered-levels (next (range))))
-(def ^:private valid-levels  (set ordered-levels))
+(def ^:private valid-levels  (set    ordered-levels))
 (def ^:private valid-level
   (fn [level]
     (or (valid-levels level)
@@ -690,14 +691,14 @@
                      logf tracef debugf infof warnf errorf fatalf reportf
                      spy get-env log-env)])
   (require '[taoensso.timbre.profiling :as profiling
-             :refer (pspy p defnp profile)])"
+             :refer (pspy p defnp profile profiled)])"
   []
   (require '[taoensso.timbre :as timbre
              :refer (log  trace  debug  info  warn  error  fatal  report
                      logf tracef debugf infof warnf errorf fatalf reportf
                      spy get-env log-env)])
   (require '[taoensso.timbre.profiling :as profiling
-             :refer (pspy p defnp profile)]))
+             :refer (pspy p defnp profile profiled)]))
 
 ;;;; Misc public utils
 

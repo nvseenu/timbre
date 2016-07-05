@@ -16,7 +16,7 @@
 
 # Timbre
 
-## A pure Clojure/Script logging library
+## A pure Clojure/Script logging+profiling library
 
 Java logging is a Kafkaesque mess of complexity that buys you _nothing_. It can be comically hard to get even the simplest logging working, and it just gets worse at scale.
 
@@ -65,7 +65,7 @@ And setup your namespace imports:
               logf tracef debugf infof warnf errorf fatalf reportf
               spy get-env log-env)]
     [taoensso.timbre.profiling :as profiling
-      :refer (pspy p defnp profile)]))
+     :refer (pspy p defnp profile profiled)]))
 
 (ns my-cljs-ns ; ; ClojureScript namespace
   (:require
@@ -296,13 +296,13 @@ Just give me a shout if you've got an appender you'd like to have added.
 
 ## Profiling
 
-> Currently Clj only
+> Now available for both Clj **and** Cljs
 
-The usual recommendation for Clojure profiling is: use a good **JVM profiler** like [YourKit], [JProfiler], or [VisualVM].
+The traditional recommendation for Clojure profiling has been: use a good **JVM profiler** like [YourKit], [JProfiler], or [VisualVM].
 
-And these can certainly do the job. But as with many Java tools, they can be a little hairy and often heavy-handed. Timbre includes a simple, lightweight alternative.
+And these can do the job. But as with many Java tools, they can be a little hairy and often heavy-handed. Timbre includes a simple, lightweight alternative.
 
-Wrap forms that you'd like to profile with the `p` macro and give them a name:
+Wrap forms that you'd like to profile with the `p` macro and give them a name (keyword id):
 
 ```clojure
 (defn my-fn
@@ -318,7 +318,7 @@ Wrap forms that you'd like to profile with the `p` macro and give them a name:
 (my-fn) => 42
 ```
 
-The `profile` macro can now be used to log times for any wrapped forms:
+The `profile` macro can now be used to log times for any thread-local wrapped forms:
 
 ```clojure
 (profile :info :Arithmetic (dotimes [n 100] (my-fn))) => "Done!"
@@ -334,11 +334,15 @@ The `profile` macro can now be used to log times for any wrapped forms:
              Total                                                     100 405ms
 ```
 
-Timbre profiling is **log level & ns filter aware**: if the level is insufficient or ns filtered, you **won't pay for profiling**.
+A `profiled` macro is also provided that returns Timbre's profiling stats as a simple Clojure map, making inspection and further analysis trivial.
 
-And since `p` and `profile` **always return their body's result**, it becomes feasible to use profiling more often as part of your normal workflow: just *leave profiling code in production as you do logging code*.
+Indeed, the major benefit of Timbre's profiling isn't that it's simple - but that **it operates from within your application** with the full power of Clojure.
 
-See also `defnp`, `sampling-profile`.
+Timbre profiling is both **highly optimized** and **log level + ns filter aware**: if the level is insufficient or ns filtered, you **won't pay for profiling**. And since Timbre's profiling macros **always return their body's result**, it's feasible to use profiling more often as part of your normal workflow: just *leave profiling code in production as you do logging code*.
+
+> **Idea**: check for and log unexpected performance regressions directly in production, or while in debug mode.
+
+A full suite of tools is provided for **multi-threaded profiling**, **conditional profiling** (e.g. sampled profiling), and more. See the [API] for details.
 
 ## This project supports the ![ClojureWerkz-logo] goals
 
