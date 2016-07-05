@@ -44,7 +44,7 @@ Happy hacking!
 Link                     | Description
 ------------------------ | -----------------------------------------------------
 [@fzakaria/slf4j-timbre] | Route log4j/logback/sfl4j log output to Timbre
-[@palletops/log-config]  | Library to help manage Timbre logging config
+[@palletops/log-config]  | Library to help manage Timbre logging config (Timbre v3 only)
 Your link here?          | **PR's welcome!**
 
 ## Getting started

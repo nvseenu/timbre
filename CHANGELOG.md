@@ -1,15 +1,22 @@
 > This project uses [Break Versioning](https://github.com/ptaoussanis/encore/blob/master/BREAK-VERSIONING.md) as of **Aug 16, 2014**.
 
-## v4.5.1 / 2016 Jun 29
+## v4.6.0 / Unreleased
 
 ```clojure
-[com.taoensso/timbre "4.5.1"]
+[com.taoensso/timbre "4.6.0-SNAPSHOT"]
 ```
 
-> This is a **minor hotfix release**
+> This is **major, non-breaking release** focused on **new profiling features**
 
-* **Hotfix**: address an issue for AOT/slf4j-timbre users.
-* **Hotfix**: missing type hint during timestamp generation.
+* **New**: Profiling: added ClojureScript support
+* **New**: Profiling util: `profiled` for returning profiling stats as a Clojure map 
+* **New**: Profiling utils: `dynamic-profiled`, `dynamic-profile` for fast multi-thread profiling
+* **New**: Profiling macros can now all act conditionally (see docstrings for more)
+* **New**: Profiling macros now support full range of ns+level compile-time elision
+* **New**: Profiling `pspy`/`p` macro now supports optional level based elision/filtering
+* **New**: Added New Relic appender [#176 @polymeris]
+* **Impl**: Improvements to clojure.tools.logging integration [#177 @MerelyAPseudonym]
+* **Impl**: Smarter (faster) spit appender path creation [#174]
 
 ## v4.5.0 / 2016 Jun 26
 
