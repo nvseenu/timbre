@@ -1,15 +1,18 @@
 > This project uses [Break Versioning](https://github.com/ptaoussanis/encore/blob/master/BREAK-VERSIONING.md) as of **Aug 16, 2014**.
 
-## v4.5.1 / 2016 Jun 29
+## v4.6.0 / Unreleased
 
 ```clojure
-[com.taoensso/timbre "4.5.1"]
+[com.taoensso/timbre "4.6.0-SNAPSHOT"]
 ```
 
-> This is a **minor hotfix release**
+> This is major feature release focused mainly on new profiling features
 
-* **Hotfix**: address an issue for AOT/slf4j-timbre users.
-* **Hotfix**: missing type hint during timestamp generation.
+* **New**: Added Cljs profiling support
+* **New**: Profiling utils: `dynamic-profile` for fast+flexible multi-thread profiling
+* **New**: Added New Relic appender [#176 @polymeris]
+* **Impl**: Improvements to clojure.tools.logging integration [#177 @MerelyAPseudonym]
+* **Impl**: Smarter (faster) spit appender path creation [#174]
 
 ## v4.5.0 / 2016 Jun 26
 
