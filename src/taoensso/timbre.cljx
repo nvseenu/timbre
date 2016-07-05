@@ -504,21 +504,20 @@
   (-log! *config* :info nil nil nil :p :auto
     (delay [(do (println "hi") :x) :y]) nil "callsite-id"))
 
-(defmacro -with-elision
-  "Implementation detail.
-  Executes body iff given level and ns pass compile-time elision."
-  [level-form ns-str-form & body]
-  (when (or (nil? compile-time-level)
-            (not (valid-levels level-form)) ; Not a compile-time level const
-            (level>= level-form compile-time-level))
+#+clj (defn- fline [and-form] (:line (meta and-form)))
+#+clj
+(defn -elide? "Implementation detail."
+  [level-form ns-str-form]
+  (not
+    (and
+      (or ; level okay
+        (nil? compile-time-level)
+        (not (valid-levels level-form)) ; Not a compile-time level const
+        (level>= level-form compile-time-level))
 
-    (when (or (not (string? ns-str-form)) ; Not a compile-time ns-str const
-              (compile-time-ns-filter ns-str-form))
-      `(do ~@body))))
-
-(comment (-with-elision :info "ns" (println "foo")))
-
-(defn- fline [and-form] (:line (meta and-form)))
+      (or ; ns okay
+        (not (string? ns-str-form)) ; Not a compile-time ns-str const
+        (compile-time-ns-filter ns-str-form)))))
 
 (defmacro log! ; Public wrapper around `-log!`
   "Core low-level log macro. Useful for tooling, etc.
@@ -532,9 +531,8 @@
   [level msg-type args & [opts]]
   (have sequential? args) ; To allow -> (delay [~@args])
   (let [{:keys [?ns-str] :or {?ns-str (str *ns*)}} opts]
-    (-with-elision
-      level   ; level-form  (may/not be a compile-time kw const)
-      ?ns-str ; ns-str-form (may/not be a compile-time str const)
+    ;; level, ns may/not be compile-time consts:
+    (when-not (-elide? level ?ns-str)
       (let [{:keys [config ?err ?file ?line ?base-data]
              :or   {config 'taoensso.timbre/*config*
                     ?err   :auto ; => Extract as err-type v0
