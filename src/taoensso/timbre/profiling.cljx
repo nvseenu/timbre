@@ -1,33 +1,215 @@
-(ns taoensso.timbre.profiling
-  "Simple, fast, cross-platform logging profiler for Timbre.
-
-  Quick usage summary:
-    1. Wrap (name) interesting forms/fns with `p`/`defnp`.
-    2. Use `profiled` to return [<result> ?<thread-local-stats>].
-       use `profile`  to return  <result> and log ?<thread-local-stats>.
-    3. Use `dynamic-profiled`,
-           `dynamic-profile` for capturing stats from all (dynamic) threads.
-
-  Filtering and elision:
-    Support ns+level elision and runtime filtering:  `p`, `profiled`, `profile`.
-    Support arbitrary conditional logging (e.g sampling): `profiled`, `profile`.
-
-  How/where to use this:
-    Timbre's profiling is highly optimized: even without elision, you can
-    usually leave profiling code in production (e.g. for sampled profiling,
-    or to detect unusual performance). Timbre's stats maps are well suited
-    to programmatic inspection + analysis."
-
+(ns taoensso.tufte "TODO docstring"
   {:author "Peter Taoussanis (@ptaoussanis)"}
-  (:require [taoensso.encore :as enc    :refer-macros ()]
-            [taoensso.timbre :as timbre :refer-macros ()])
+  #+clj  (:require [clojure.string  :as str]
+                   [taoensso.encore :as enc :refer (qb have have?)])
+  #+cljs (:require [clojure.string  :as str]
+                   [taoensso.encore :as enc :refer-macros (have have?)])
+  #+clj  (:import  [java.util LinkedList]))
 
-  #+cljs (:require-macros [taoensso.timbre.profiling :refer (nano-time)])
-  #+clj  (:import [java.util LinkedList]))
+;; TODO Move appropriate stuff to an impl.cljx ns?
 
-(comment (require '[taoensso.encore :as enc :refer (qb)]))
+;; (def ^:dynamic *foo1* {:a :A :b :B})
+;; (def ^:dynamic *foo2* :A)
+;; (def ^:dynamic *foo3* :B)
 
-;;;; Platform stuff
+;; (qb 1e5
+;;   (let [{:keys [a b]} *foo1*] [a b])
+;;   [*foo2* *foo3*]
+;;   (binding [*foo1* {:a :A :b :B}])
+;;   (binding [*foo2* :A]
+;;     (binding [*foo3* :B])
+;;     )
+;;   (binding [*foo2* :A *foo3* :B])
+;;   )
+
+;; [22.97 20.42 54.88 120.89 95.96]
+;; [16.53 4.86]
+
+;;;; Level filtering
+
+(defn          valid-level? [x] (if (#{0 1 2 3 4 5} x) true false))
+(defn ^:static valid-level
+  "Returns argument if it's a valid profiling level, else throws."
+  [x]
+  (or
+    (#{0 1 2 3 4 5} x)
+    (throw
+      (ex-info "Invalid profiling level: should be int e/o #{0 1 2 3 4 5}"
+        {:given x :type (type x)}))))
+
+(comment (qb 1e5 (valid-level 4)))
+
+(def ^:dynamic *-min-level* "e/o #{0 1 2 3 4 5}" 2)
+(defn        set-min-level!
+  "Sets root binding of minimum profiling level, e/o #{0 1 2 3 4 5}."
+  [level]
+  (valid-level level)
+  #+cljs (set!             *-min-level*        level)
+  #+clj  (alter-var-root #'*-min-level* (fn [_] level)))
+
+(comment (qb 1e5 *-min-level*))
+
+(defmacro with-min-level
+  "Executes body with dynamic minimum profiling level, e/o #{0 1 2 3 4 5}."
+  [level & body]
+  (when (integer? level) (valid-level level))
+  `(binding [*-min-level* (valid-level ~level)]
+     ~@body))
+
+(defn #+clj  ^:static >=min-runtime-level?
+      #+cljs ^boolean >=min-runtime-level?
+  "Returns true iff given level >= current dynamic minimum profiling level."
+  [level]
+  (>= ^long (valid-level level)
+      ^long *-min-level*))
+
+(comment (qb 1e5 (>=min-runtime-level? 2)))
+
+;;;; Namespace filtering (shares code with Timbre)
+
+(def ^:private compile-ns-pattern
+  "Returns (fn [?ns]) -> truthy"
+  (let [compile1
+        (fn [x]
+          (cond
+            (enc/re-pattern? x) (fn [ns-str] (re-find x ns-str))
+            (string? x)
+            (if (enc/str-contains? x "*")
+              (let [re
+                    (re-pattern
+                      (-> (str "^" x "$")
+                          (str/replace "." "\\.")
+                          (str/replace "*" "(.*)")))]
+                (fn [ns-str] (re-find re ns-str)))
+              (fn [ns-str] (= ns-str x)))
+
+            :else (throw (ex-info "Unexpected ns-pattern type"
+                           {:given x :type (type x)}))))]
+
+    (enc/memoize_
+      (fn self
+        ([ns-pattern] ; Useful for user-level matching
+         (let [x ns-pattern]
+           (cond
+             (map? x) (self (:whitelist x) (:blacklist x))
+             (or (vector? x) (set? x)) (self x nil)
+             (= x "*") (fn [?ns] true)
+             :else
+             (let [match? (compile1 x)]
+               (fn [?ns] (if (match? (str ?ns)) true))))))
+
+        ([whitelist blacklist]
+         (let [white
+               (when (seq whitelist)
+                 (let [match-fns (mapv compile1 whitelist)
+                       [m1 & mn] match-fns]
+                   (if mn
+                     (fn [ns-str] (enc/rsome #(% ns-str) match-fns))
+                     (fn [ns-str] (m1 ns-str)))))
+
+               black
+               (when (seq blacklist)
+                 (let [match-fns (mapv compile1 blacklist)
+                       [m1 & mn] match-fns]
+                   (if mn
+                     (fn [ns-str] (not (enc/rsome #(% ns-str) match-fns)))
+                     (fn [ns-str] (not (m1 ns-str))))))]
+           (cond
+             (and white black)
+             (fn [?ns]
+               (let [ns-str (str ?ns)]
+                 (if (white ns-str)
+                   (if (black ns-str)
+                     true))))
+
+             white (fn [?ns] (if (white (str ?ns)) true))
+             black (fn [?ns] (if (black (str ?ns)) true))
+             :else (fn [?ns] true) ; Common case
+             )))))))
+
+(def ns-filter
+  (fn [ns-pattern] ; (fn [?ns]) -> truthy
+    (enc/memoize_ (compile-ns-pattern ns-pattern))))
+
+(def ^:private ns-pass?
+  "Returns true iff given ns passes white/black lists."
+  (enc/memoize_
+    (fn [whitelist blacklist ?ns]
+      ((compile-ns-pattern whitelist blacklist) ?ns))))
+
+(comment
+  (qb 1e6 (ns-pass? ["foo.*"] ["foo.baz"] "foo.bar")) ; 217.4
+  (ns-pass? nil nil "")
+  (ns-pass? nil nil nil))
+
+(def ^:dynamic *-ns-filter* (ns-filter "*"))
+(defn set-ns-pattern! [ns-pattern]
+  (let [f (ns-filter ns-pattern)]
+    #+cljs (set!             *-ns-filter*        f)
+    #+clj  (alter-var-root #'*-ns-filter* (fn [_] f))))
+
+(defmacro with-ns-pattern [ns-pattern & body]
+  (let [f (ns-filter ns-pattern)]
+    `(binding [*-ns-filter* f]
+       ~@body)))
+
+;;;; Elision support
+
+#+clj
+(def ^:private compile-time-min-level ; Will stack with runtime checks
+  (when-let [level (enc/read-sys-val "TUFTE_LEVEL")]
+    (println (str "Compile-time (elision) Tufte level: " level))
+    (valid-level level)))
+
+#+clj
+(def ^:private compile-time-ns-pass? ; Will stack with runtime checks
+  (let [ns-pattern (enc/read-sys-val "TUFTE_NS_PATTERN")]
+    (when ns-pattern (println (str "Compile-time (elision) Tufte ns-pattern: " ns-pattern)))
+    (ns-filter (or ns-pattern "*"))))
+
+#+clj ; Call only at compile-time
+(defn -elide? [level-form ns-str-form]
+  (not
+    (and
+      (or ; Level okay
+        (nil? compile-time-min-level)
+        (not (valid-level? level-form)) ; Not a compile-time level const
+        (>= ^long level-form ^long compile-time-min-level))
+
+      (or ; Namespace okay
+        (not (string? ns-str-form)) ; Not a compile-time ns-str const
+        (compile-time-ns-pass? ns-str-form)))))
+
+;;;; Runtime filtering
+
+(defn runtime-pass?
+  ([level   ] (runtime-pass? level *ns*))
+  ([level ns]
+   (if (>= ^long (valid-level level)
+           ^long *-min-level*)
+     (if (*-ns-filter* ns) true))))
+
+(comment (qb 1e5 (runtime-pass? 2)))
+
+;;;; Handlers
+
+;; TODO
+;; `profile` -> put {:id _ :stats_ _ :line _ :ns-str _ :str_ (delay)}
+;; note that stats can be forcible/delayed (esp. for merges)
+
+(def ^:private handlers_ "{<sub-id> [<ch> <handler>]}" (atom nil))
+(defn       set-handler!
+  ([handler-id ?handler-fn] (set-handler! handler-id ?handler-fn "*"))
+  ([handler-id ?handler-fn ns-pattern]
+   ;; TODO pattern
+   (if-let [f ?handler-fn]
+     (swap! handlers_ assoc  handler-id f)
+     (swap! handlers_ dissoc handler-id))
+   nil))
+
+(defn- handle! [val] (enc/run-kv! (fn [_ f] (f val)) @handlers_))
+
+;;;; Time tracking
 
 (defmacro nano-time [] `(enc/if-cljs (enc/nano-time) (System/nanoTime)))
 (comment (macroexpand '(nano-time)))
@@ -53,8 +235,6 @@
     (fn
       ([]                @state_)
       ([new-val] (vreset! state_ new-val)))))
-
-;;;; Core fns
 
 (declare ^:private times->stats)
 
@@ -141,17 +321,6 @@
 
 (comment (times->stats (new-times) nil))
 
-;;;; Elision support
-
-#+clj
-(def ^:private elide-profiling?
-  "Completely elide all profiling regardless of level/ns?"
-  (enc/read-sys-val "TIMBRE_ELIDE_PROFILING"))
-
-#+clj
-(defn -elide? [level-form ns-str-form]
-  (or elide-profiling? (timbre/-elide? level-form ns-str-form)))
-
 ;;;; Core macros
 
 (def ^:dynamic *sacc* "Dynamic stats accumulator, experimental" nil)
@@ -168,7 +337,7 @@
       (let [test s2, body sn]
         (if (-elide? level (str *ns*))
           `[(do ~@body)]
-          `(if (and (timbre/log? ~level ~(str *ns*)) ~test)
+          `(if (and (runtime-pass? ~level ~(str *ns*)) ~test)
              (try
                (start-profiling!)
                (let [result# (do ~@body)
@@ -184,7 +353,7 @@
              [(do ~@body)]))))))
 
 (comment
-  (qb 1e5 (profiled :info (p :p1))) ; 176
+  (qb 1e5 (profiled 2 (p :p1))) ; 176
   (profiled :info :when (chance 0.5) (p :p1) "foo"))
 
 (defn- compile-time-pid [id]
@@ -204,7 +373,7 @@
   [& specs]
   (let [[s1 s2] specs
         [level id body]
-        (if (and (timbre/level? s1) (enc/ident? s2))
+        (if (and (valid-level? s1) (enc/ident? s2))
           [s1      s2 (nnext specs)]
           [:report s1  (next specs)])]
 
@@ -222,20 +391,74 @@
 
 (comment (macroexpand '(pspy :info foo/id "foo")))
 
-;;;; Helper macros, etc.
+
+;;;; User-level utils
+
+
+
+
+
+
 
 (defn chance [p] (< ^double (rand) (double p)))
+
+
+
+
+;;;;
+
+
+
+(comment ; TODO temp ideas
+
+  ;; capture id'd times iff *level* okay, ns okay, tlp is on
+  (p :level :id ...)
+
+  ;; enable tlp iff *level* okay, ns okay
+  (profiled :level ...)
+
+  ;; enable dynamic capture iff *level* okay, ns okay
+  ;; question is: should this override local levels? conds?
+  (dynamic-profiled :level ...)
+
+  ;; :trace :debug :info :report
+  ;; or verbosity: just an arbitrary integer
+
+  ;; *min-level* 4
+  ;; (profiled 5)
+
+  ;; maybe 0-5
+
+  (profiled 0 ...) ; => never
+  (profiled 5 ...) ; => always
+  ;; 1, 2, 3, 4    ; depends
+
+  (defn  profiling-thread? [] (if (-pdata-proxy) true false))
+  (defn profiling-dynamic? [] (if *sacc*         true false))
+
+  )
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;
+
+
+;;;; Helper macros, etc.
+
+
 
 (defmacro p "`pspy` alias" [& specs] `(pspy ~@specs))
 (comment (macroexpand '(p :foo (+ 4 2))))
 
 (declare format-stats)
 (defmacro  -log-stats [level id stats]
-  `(timbre/log! ~level :p
+  `(handle! {:level ~level :id ~id :stats ~stats})
+  #_`(timbre/log! ~level :p
      ["Profiling: " ~id "\n" (format-stats ~stats)]
      {:?base-data {:profile-stats ~stats}}))
 
-(comment (profile :info :my-id :when true "foo"))
+(comment (profile 2 :my-id :when true "foo"))
 
 (defmacro profile
   "When logging is enabled, executes named body with thread-local profiling
@@ -251,7 +474,7 @@
 ;;;; Multi-threaded profiling ; Experimental
 
 (defn merge-stats
-  "Merges stats maps from multiple runs, threads, etc.
+  "Merges stats maps from multiple runs or threads.
   Automatically identifies and merges concurrent time windows."
   [s1 s2]
   (if s1
@@ -321,12 +544,10 @@
 
 (defn stats-accumulator
   "Experimental, subject to change!
-  Small util to help merge stats maps from multiple threads.
+  Small util to help merge stats maps from multiple runs or threads.
   Returns a stateful fn with arities:
     ([stats-map]) ; Accumulates the given stats (you may call this from any thread)
-    ([])          ; Deref: returns the merged value of all accumulated stats
-
-  See also `profile-into`."
+    ([])          ; Deref: returns the merged value of all accumulated stats"
   []
   (let [acc_ (atom nil)
         reduce-stats_
@@ -340,31 +561,6 @@
 
 (comment (qb 1e5 (stats-accumulator)))
 
-(defmacro profile-into
-  "Experimental, subject to change!
-  When logging is enabled, executes body with thread-local profiling
-  and adds stats to given accumulator. Always returns body's result.
-  See also `stats-accumulator`."
-  {:arglists '([?stats-accumulator level            & body]
-               [?stats-accumulator level :when test & body])}
-  [sacc level & sigs]
-  (let [[s1 s2 & sn] sigs]
-    (if-not (= s1 :when)
-      `(profiled-into ~sacc ~level :when true ~@sigs)
-      (let [test s2, body sn]
-        (if (-elide? level (str *ns*))
-          `(do ~@body)
-          `(let [sacc# ~sacc]
-             (if (and sacc# (timbre/log? ~level ~(str *ns*)) ~test)
-               (try
-                 (start-profiling!)
-                 (let [result# (do ~@body)
-                       stats# (stop-profiling!)]
-                   (sacc# stats#)
-                   result#)
-                 (finally (-pdata-proxy nil))))
-             (do ~@body)))))))
-
 (defmacro dynamic-profiled
   "Experimental, subject to change!
   When logging is enabled, executes body with a dynamic binding that
@@ -373,7 +569,7 @@
   [level & body]
   (if (-elide? level (str *ns*))
     `[(do ~@body)]
-    `(if (timbre/log? ~level ~(str *ns*))
+    `(if (runtime-pass? ~level ~(str *ns*))
        (let [sacc# (stats-accumulator)]
          (binding [*sacc* sacc#]
            [(do ~@body) (sacc#)]))
@@ -386,7 +582,7 @@
   [level id & body]
   (if (-elide? level (str *ns*))
     `[(do ~@body)]
-    `(if (timbre/log? ~level ~(str *ns*))
+    `(if (runtime-pass? ~level ~(str *ns*))
        (let [sacc# (stats-accumulator)]
          (binding [*sacc* sacc#]
            (let [result# (do ~@body)
@@ -575,3 +771,38 @@
   (profile  :info :high-n     (dotimes [n 1e6] (p :p1 nil))) ; ~119ms
   (profiled :info (dotimes [n 1e6] (p :p1 nil)))
   (sampling-profile :info 0.5 :sampling-test (p :p1 "Hello!")))
+
+(comment
+  (def ^:dynamic *pdata_* "(atom {<id> <times>}), nnil iff profiling" nil)
+  (defmacro -with-pdata_ [& body] `(binding [*pdata_* (atom {})] ~@body)) ; Dev
+
+  (comment (qb 1e6 (if *pdata_* true false) (if false true false)))
+
+  (declare ^:private times->stats)
+  (defn -capture-time!
+    ([       id t-elapsed] (-capture-time! *pdata_* id t-elapsed)) ; Dev
+    ([pdata_ id t-elapsed] ; Common case
+     (let [?pulled-times
+           (loop []
+             (let [pdata @pdata_]
+               (let [times (get pdata id ())]
+                 (if (>= (count times) 2000000) ; Rare in real-world use
+                   (if (compare-and-set! pdata_ pdata ; Never leave empty times:
+                         (assoc pdata id (conj () t-elapsed)))
+                     times ; Pull accumulated times
+                     (recur))
+
+                   (if (compare-and-set! pdata_ pdata
+                         (assoc pdata id (conj times t-elapsed)))
+                     nil
+                     (recur))))))]
+
+       (when-let [times ?pulled-times]
+         ;; Compact: merge interim stats to help prevent OOMs
+         (let [base-stats (get-in @pdata_ [:__stats id])
+               stats (times->stats times base-stats)]
+           ;; Can safely assume that base-stats should be stable
+           (swap! pdata_ assoc-in [:__stats id] stats)))
+
+       nil))))
+
